@@ -33,7 +33,7 @@ while not done:
     done = terminated or truncated
 print(reward, info)
 
-See bottom for example baseline policies and quick self‑test.
+See bottom for example baseline policies and quick self-test.
 """
 from __future__ import annotations
 

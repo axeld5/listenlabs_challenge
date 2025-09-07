@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from typing import Optional
 import os
+import numpy as np
 
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback
@@ -107,8 +108,10 @@ class SB3PPOPolicy:
             self.model = PPO(policy_name, self.monitor_env, **ppo_kwargs)
 
     def act(self, obs) -> int:
-        """Get action from the trained PPO policy."""
         action, _ = self.model.predict(obs, deterministic=True)
+        # handle shape (1,) vs scalar
+        if isinstance(action, np.ndarray):
+            return int(action.item())
         return int(action)
 
     def train(self, total_timesteps: int = 100000, eval_freq: int = 10000,

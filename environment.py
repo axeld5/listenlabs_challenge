@@ -32,13 +32,12 @@ class BerghainEnv(gym.Env):
         self.attrs = scenario.attrs
         self.K = len(self.attrs)
         self.action_space = spaces.Discrete(2)  # 0=reject, 1=accept
-        self.observation_space = spaces.Dict(
-            {
-                'attrs': spaces.MultiBinary(self.K),
-                'accepted': spaces.Discrete(self.N + 1),
-                'rejected': spaces.Discrete(self.max_rejects + 1),
-            }
-        )
+        self.observation_space = spaces.Dict({
+            'attrs': spaces.MultiBinary(self.K),
+            'accepted': spaces.Discrete(self.N + 1),
+            'rejected': spaces.Discrete(self.max_rejects + 1),
+            'remaining': spaces.MultiDiscrete([self.N + 1] * self.K),  # NEW
+        })
         self._seed = seed
         self._rng = np.random.default_rng(seed)
         self._sampler = CorrelatedBernoulli(scenario.marginals, scenario.corr, self._rng)
@@ -62,11 +61,29 @@ class BerghainEnv(gym.Env):
         return self._obs(), self._info()
 
     def _obs(self):
+        rem = [self._remaining_needs().get(name, 0) for name in self.attrs]
         return {
             'attrs': self.current.copy(),
             'accepted': int(self.accepted),
             'rejected': int(self.rejected),
+            'remaining': np.array(rem, dtype=np.int32),
         }
+
+    def _impossible_now(self) -> bool:
+        remaining_slots = self.N - self.accepted
+        for need in self._remaining_needs().values():
+            if remaining_slots < need:
+                return True
+        return False
+    
+    def _remaining_needs(self) -> Dict[str, int]:
+        req = self.scenario.required_counts()
+        rem = {}
+        for name, need in req.items():
+            idx = self.attrs.index(name)
+            have = int(self.counts[idx])
+            rem[name] = max(0, need - have)
+        return rem
 
     def _info(self):
         return {
@@ -96,14 +113,19 @@ class BerghainEnv(gym.Env):
         if self.accepted < self.N and self.rejected < self.max_rejects:
             self.current = self._sampler.sample()
 
+        if not terminated and self._impossible_now():
+            terminated = True
+            # big fail, but not astronomical; keep gradient sane
+            reward = -100.0
+
         # check termination
         if self.accepted >= self.N or self.rejected >= self.max_rejects:
             terminated = True
             success = self._constraints_satisfied() and (self.accepted >= self.N)
             if success:
-                reward = -float(self.rejected)
+                reward = -float(self.rejected)/10000
             else:
-                reward = -100000.0
+                reward = -100.0
             info = {
                 **self._info(),
                 'success': success,
