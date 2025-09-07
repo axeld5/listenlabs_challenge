@@ -38,7 +38,56 @@ See bottom for example baseline policies and quick self-test.
 from __future__ import annotations
 
 from environment import make_env
-from baseline_policy import PPOPolicy
+from ppo_policy import PPOPolicy
+
+import torch.nn as nn
+from pathlib import Path
+
+from baseline_policy import FeasibilityBaseline  # import the heuristic
+from environment import BerghainEnv
+
+def warm_safe_run(env_key='custom_scenario_1', seed=0,
+                  bc_episodes=400, bc_epochs=5, bc_batch=4096,
+                  total_timesteps=2_000_000):
+    env = make_env(env_key, seed=seed)
+
+    policy_kwargs = dict(
+        net_arch=dict(pi=[512, 512, 256], vf=[512, 512, 256]),
+        activation_fn=nn.ReLU,
+        ortho_init=True,
+    )
+
+    pi = PPOPolicy(
+        env,
+        verbose=1,
+        seed=seed,
+        n_envs=16,
+        n_steps=8192,
+        batch_size=2048,
+        n_epochs=10,
+        gamma=0.997,
+        gae_lambda=0.95,
+        clip_range=0.2,
+        ent_coef=0.005,
+        learning_rate=3e-4,
+        policy_kwargs=policy_kwargs,
+    )
+
+    teacher = FeasibilityBaseline(BerghainEnv(env.scenario, seed=seed))
+    print("BC warm-start from FeasibilityBaseline...")
+    pi.pretrain_with_teacher(teacher=teacher, episodes=bc_episodes, epochs=bc_epochs, batch_size=bc_batch, seed=seed)
+
+    print(f"PPO fine-tuning for {total_timesteps} timesteps...")
+    pi.train(total_timesteps=total_timesteps, eval_freq=50_000, progress_bar=True)
+
+    Path("models").mkdir(exist_ok=True)
+    save_path = f"models/{env_key}_warm_safe_ppo.zip"
+    pi.save(save_path)
+
+    avg_reward, success_rate = pi.evaluate(eval_episodes=20)
+    print(f"[WARM+SAFE] avg_reward: {avg_reward:.3f} | success_rate: {success_rate:.3f}")
+    print(f"Saved to: {save_path} and {save_path}_vecnorm.pkl")
+    return save_path, (avg_reward, success_rate)
 
 
 # ----------------------------
@@ -67,6 +116,48 @@ def print_policy_arch(pi):
     except Exception as e:
         print(f"(Could not dig into submodules: {e})")
 
+import os
+from pathlib import Path
+import torch.nn as nn
+
+def long_run(env_key='custom_scenario_1', seed=0, total_timesteps=3_000_000):
+    env = make_env(env_key, seed=seed)
+
+    policy_kwargs = dict(
+        net_arch=dict(pi=[512, 512, 256], vf=[512, 512, 256]),
+        activation_fn=nn.ReLU,
+        ortho_init=True,
+    )
+
+    pi = PPOPolicy(
+        env,
+        verbose=1,
+        seed=seed,
+        n_envs=16,
+        n_steps=8192,
+        batch_size=2048,
+        n_epochs=10,
+        gamma=0.997,
+        gae_lambda=0.95,
+        clip_range=0.2,
+        ent_coef=0.005,
+        learning_rate=3e-4,
+        policy_kwargs=policy_kwargs,
+    )
+
+    print_policy_arch(pi)  # show the larger architecture
+
+    print(f"Starting LONG RUN for {total_timesteps} timesteps...")
+    pi.train(total_timesteps=total_timesteps, eval_freq=50_000, progress_bar=True)
+
+    Path("models").mkdir(exist_ok=True)
+    save_path = f"models/{env_key}_longrun_ppo.zip"
+    pi.save(save_path)
+
+    avg_reward, success_rate = pi.evaluate(eval_episodes=20)
+    print(f"\n[LONG RUN] avg_reward: {avg_reward:.3f} | success_rate: {success_rate:.3f}")
+    print(f"Saved to: {save_path} and {save_path}_vecnorm.pkl")
+    return save_path, (avg_reward, success_rate)
 
 def _quick_run(env_key='custom_scenario_1', episodes=1, seed=0, train_timesteps=10000):
     env = make_env(env_key, seed=seed)
@@ -96,7 +187,19 @@ def _quick_run(env_key='custom_scenario_1', episodes=1, seed=0, train_timesteps=
 
 
 if __name__ == '__main__':
-    # Smoke test of the custom scenarios
-    for key in ['custom_scenario_1']: #, 'custom_scenario_2', 'custom_scenario_3']:
-        res = _quick_run(key, episodes=2, seed=123, train_timesteps=5000)  # Reduced for quick testing
-        print(key, res)
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--mode', choices=['quick', 'long', 'warmlong', 'warm_safe'], default='quick')
+    parser.add_argument('--scenario', default='custom_scenario_1')
+    parser.add_argument('--seed', type=int, default=123)
+    parser.add_argument('--timesteps', type=int, default=5_000)  # for quick
+    args = parser.parse_args()
+
+    if args.mode == 'quick':
+        res = _quick_run(args.scenario, episodes=2, seed=args.seed, train_timesteps=args.timesteps)
+        print(args.scenario, res)
+    elif args.mode == 'warm_safe':
+        warm_safe_run(args.scenario, seed=args.seed, bc_episodes=400, total_timesteps=2_000_000)
+    else:
+        # keep your other modes if you added them earlier
+        warm_safe_run(args.scenario, seed=args.seed, bc_episodes=0, total_timesteps=3_000_000)
