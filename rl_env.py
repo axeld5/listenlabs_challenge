@@ -45,13 +45,39 @@ from baseline_policy import PPOPolicy
 # Quick self‑test (includes the three new scenarios)
 # ----------------------------
 
+def print_policy_arch(pi):
+    # pi is your SB3PPOPolicy instance
+    policy = pi.model.policy  # sb3 torch.nn.Module
+    print("\n=== Policy Module ===")
+    print(policy)  # full module tree
+
+    # Useful submodules (MultiInputPolicy)
+    try:
+        print("\n--- Features Extractor ---")
+        print(policy.features_extractor)
+
+        print("\n--- MLP Extractor (shared trunk) ---")
+        print(policy.mlp_extractor)
+
+        print("\n--- Actor (pi) head ---")
+        print(policy.mlp_extractor.policy_net)
+
+        print("\n--- Critic (vf) head ---")
+        print(policy.mlp_extractor.value_net)
+    except Exception as e:
+        print(f"(Could not dig into submodules: {e})")
+
+
 def _quick_run(env_key='custom_scenario_1', episodes=1, seed=0, train_timesteps=10000):
     env = make_env(env_key, seed=seed)
     pi = PPOPolicy(env, verbose=0)
 
     # Train the policy first
+    print_policy_arch(pi)  # print immediately (untrained)
     print(f"Training SB3 PPO policy for {train_timesteps} timesteps...")
-    pi.train(total_timesteps=train_timesteps, eval_freq=0)  # Disable callback for now
+    pi.train(total_timesteps=train_timesteps, eval_freq=0)
+
+    print("\n=== Policy Module (after training) ===")
 
     results = []
     for ep in range(episodes):

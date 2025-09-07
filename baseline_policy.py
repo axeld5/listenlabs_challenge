@@ -14,6 +14,11 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import DummyVecEnv
+from stable_baselines3.common.vec_env import SubprocVecEnv, VecMonitor, VecNormalize
+from stable_baselines3.common.utils import set_random_seed
+from stable_baselines3.common.callbacks import EvalCallback
+from wrappers import FloatifyObs
+
 
 from environment import BerghainEnv
 
@@ -60,27 +65,40 @@ class PPOCallback(BaseCallback):
 
 
 class SB3PPOPolicy:
-    """
-    PPO-based policy using Stable-Baselines3 for the Berghain Challenge environment.
-    """
-
     def __init__(self, env: BerghainEnv, policy_path: Optional[str] = None,
                  learning_rate: float = 3e-4, n_steps: int = 2048,
                  batch_size: int = 64, n_epochs: int = 10,
                  gamma: float = 0.99, gae_lambda: float = 0.95,
                  clip_range: float = 0.2, ent_coef: float = 0.01,
                  vf_coef: float = 0.5, max_grad_norm: float = 0.5,
-                 verbose: int = 1, device: str = "auto", **kwargs):
+                 verbose: int = 1, device: str = "auto",
+                 n_envs: int = 8, seed: int = 0, **kwargs):
 
         self.env = env
+        self._seed = seed
 
-        # Wrap environment with Monitor and DummyVecEnv for SB3 compatibility
-        def make_env():
-            return Monitor(env)
+        def make_one(rank: int):
+            def _init():
+                e = BerghainEnv(env.scenario, seed=None)   # fresh env
+                e = FloatifyObs(e)                         # cast counts to float Boxes
+                e.reset(seed=seed + rank)
+                return e
+            return _init
 
-        self.monitor_env = DummyVecEnv([make_env])
+        set_random_seed(seed)
+        train_vec = SubprocVecEnv([make_one(i) for i in range(n_envs)])
+        train_vec = VecMonitor(train_vec)  # single VecMonitor at vector level
 
-        # PPO hyperparameters
+        # Only normalize the Box keys (attrs stays MultiBinary in the base env)
+        self.monitor_env = VecNormalize(
+            train_vec,
+            norm_obs=True,
+            norm_reward=True,
+            clip_obs=10.0,
+            norm_obs_keys=["accepted", "rejected", "remaining"],  # <-- important
+        )
+
+        # PPO init as before...
         ppo_kwargs = {
             'learning_rate': learning_rate,
             'n_steps': n_steps,
@@ -96,82 +114,135 @@ class SB3PPOPolicy:
             'device': device,
             **kwargs
         }
-
-        # Initialize PPO model
+        policy_name = "MultiInputPolicy"
         if policy_path is not None and os.path.exists(policy_path):
             print(f"Loading PPO model from {policy_path}")
             self.model = PPO.load(policy_path, env=self.monitor_env, **ppo_kwargs)
         else:
-            print("Creating new PPO model")
-            # Use MultiInputPolicy for dict observation spaces
-            policy_name = "MultiInputPolicy"
+            print("Creating new PPO model (parallel envs + normalization)")
             self.model = PPO(policy_name, self.monitor_env, **ppo_kwargs)
 
+    def _prepare_single_obs(self, obs: dict) -> dict:
+            """Match the training-time FloatifyObs shapes/dtypes for a single observation."""
+            return {
+                'attrs': np.asarray(obs['attrs'], dtype=np.int8),
+                'accepted': np.array([obs['accepted']], dtype=np.float32),  # (1,)
+                'rejected': np.array([obs['rejected']], dtype=np.float32),  # (1,)
+                'remaining': np.asarray(obs['remaining'], dtype=np.float32) # (K,)
+            }
+
+    def _prepare_single_obs(self, obs: dict) -> dict:
+        import numpy as np
+        return {
+            'attrs': np.asarray(obs['attrs'], dtype=np.int8),
+            'accepted': np.array([obs['accepted']], dtype=np.float32),  # (1,)
+            'rejected': np.array([obs['rejected']], dtype=np.float32),  # (1,)
+            'remaining': np.asarray(obs['remaining'], dtype=np.float32) # (K,)
+        }
+
     def act(self, obs) -> int:
+        import numpy as np
+        # shape-correct the raw dict obs
+        if isinstance(obs, dict):
+            obs = self._prepare_single_obs(obs)
+            # add batch dim for VecNormalize
+            batched = {k: v[None, ...] for k, v in obs.items()}
+            # normalize using running stats (only the keys you set in norm_obs_keys)
+            norm = self.monitor_env.normalize_obs(batched)  # <-- no clip_obs kw
+            # remove batch dim
+            obs = {k: v[0] for k, v in norm.items()}
+
         action, _ = self.model.predict(obs, deterministic=True)
-        # handle shape (1,) vs scalar
-        if isinstance(action, np.ndarray):
-            return int(action.item())
-        return int(action)
+        return int(action.item() if isinstance(action, np.ndarray) else action)
 
-    def train(self, total_timesteps: int = 100000, eval_freq: int = 10000,
-              progress_bar: bool = True) -> PPO:
-        """
-        Train the PPO policy.
 
-        Args:
-            total_timesteps: Total number of environment steps to train for
-            eval_freq: Frequency of evaluation callbacks
-            progress_bar: Whether to show progress bar
-        """
+
+    def train(self, total_timesteps: int = 100000, eval_freq: int = 10000, progress_bar: bool = True) -> PPO:
         print(f"Starting PPO training for {total_timesteps} timesteps...")
 
-        # Create callback for evaluation
-        callback = PPOCallback(eval_freq=eval_freq, verbose=1) if eval_freq > 0 else None
+        def make_eval_env():
+            e = BerghainEnv(self.env.scenario, seed=12345)
+            e = FloatifyObs(e)
+            return e
 
-        # Train the model
+        eval_raw = DummyVecEnv([make_eval_env])
+        eval_raw = VecMonitor(eval_raw)
+
+        eval_vec = VecNormalize(
+            eval_raw,
+            training=False,
+            norm_obs=True,
+            norm_reward=True,
+            clip_obs=10.0,
+            norm_obs_keys=["accepted", "rejected", "remaining"],
+        )
+        # share running stats so eval uses identical normalization
+        eval_vec.obs_rms = self.monitor_env.obs_rms
+        eval_vec.ret_rms = self.monitor_env.ret_rms
+
+        eval_cb = EvalCallback(
+            eval_vec,
+            best_model_save_path=None,
+            log_path=None,
+            eval_freq=eval_freq,
+            deterministic=True,
+            render=False,
+            n_eval_episodes=5
+        ) if eval_freq and eval_freq > 0 else None
+
         self.model.learn(
             total_timesteps=total_timesteps,
-            callback=callback,
+            callback=eval_cb,
             progress_bar=progress_bar
         )
-
         print("Training completed!")
         return self.model
 
+
     def save(self, path: str):
-        """Save the trained PPO model."""
         self.model.save(path)
-        print(f"Model saved to {path}")
+        # save VecNormalize stats next to the model
+        self.monitor_env.save(path + "_vecnorm.pkl")
+        print(f"Model saved to {path} (+ normalization stats)")
 
     def load(self, path: str):
-        """Load a trained PPO model."""
+        # the constructor already created self.monitor_env; just load stats into it
+        self.monitor_env = VecNormalize.load(path + "_vecnorm.pkl", self.monitor_env)
         self.model = PPO.load(path, env=self.monitor_env)
-        print(f"Model loaded from {path}")
+        print(f"Model + normalization loaded from {path}")
 
     def evaluate(self, eval_episodes: int = 10) -> tuple[float, float]:
-        """Evaluate the current policy."""
-        total_reward = 0
-        successes = 0
+        from stable_baselines3.common.vec_env import DummyVecEnv
 
-        for ep in range(eval_episodes):
-            obs, info = self.env.reset()
-            episode_reward = 0
+        def make_eval_env():
+            e = BerghainEnv(self.env.scenario, seed=98765)
+            e = FloatifyObs(e)
+            e = Monitor(e)
+            return e
+
+        eval_raw = DummyVecEnv([make_eval_env])
+        eval_vec = VecNormalize(eval_raw, training=False, norm_obs=True, norm_reward=True, clip_obs=10.0)
+        # share current stats
+        eval_vec.obs_rms = self.monitor_env.obs_rms
+        eval_vec.ret_rms = self.monitor_env.ret_rms
+
+        total_reward, successes = 0.0, 0
+        for _ in range(eval_episodes):
+            obs = eval_vec.reset()
             done = False
-
+            ep_rew = 0.0
             while not done:
-                action = self.act(obs)
-                obs, reward, terminated, truncated, info = self.env.step(action)
-                episode_reward += reward
-                done = terminated or truncated
-
-            total_reward += episode_reward
-            if info.get('success', False):
+                action, _ = self.model.predict(obs, deterministic=True)
+                obs, reward, terminated, truncated, info = eval_vec.step(action)
+                ep_rew += float(reward)
+                done = bool(terminated) or bool(truncated)
+            total_reward += ep_rew
+            # success flag is inside info list for vec envs
+            if info and isinstance(info, (list, tuple)) and len(info) and info[0].get('success', False):
                 successes += 1
 
-        avg_reward = total_reward / eval_episodes
-        success_rate = successes / eval_episodes
-        return avg_reward, success_rate
+        return total_reward / eval_episodes, successes / eval_episodes
+
 
 
 # Backward compatibility - create alias for old interface
